@@ -34,13 +34,15 @@ class QwenRuntimeTests(unittest.TestCase):
             VoiceActivityDetector=lambda *args, **kwargs: vad,
         )
         import tempfile
-        with tempfile.NamedTemporaryFile() as audio:
-            audio.write(data); audio.flush()
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / 'audio.raw'
+            audio.write_bytes(data)
             with patch.dict(sys.modules, {'sherpa_onnx': sherpa}), \
                  patch('src.ai.qwen_transcriber.plan_long_chunks', return_value=chunks or []):
                 return transcriber._consume_pcm_stream(
                     read_fn or io.BytesIO(data).read, lambda: True,
-                    lambda: b'', lambda: 0, audio_path=audio.name,
+                    lambda: b'', lambda: 0, audio_path=str(audio),
                 )
 
     def test_drains_final_pcm_written_between_empty_read_and_process_exit(self):

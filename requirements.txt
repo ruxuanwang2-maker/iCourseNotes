@@ -1,4 +1,6 @@
 requests
+python-dotenv
+imageio-ffmpeg
 pycryptodome
 sherpa-onnx
 numpy

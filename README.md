@@ -187,6 +187,33 @@ GitHub Pages 部署是可选且**仅手动触发**：配置 Pages 后运行 **De
 
 ## 开发
 
+### 本机课程工作台
+
+完成 `.env` 配置并安装运行依赖后，在 PowerShell 中运行 `./start_dashboard.ps1`，
+浏览器打开 `http://127.0.0.1:18081/`。本机控制台提供：
+
+- 启动与停止现有 `run_local.py` 课程处理进程，拦截重复启动。
+- 实时资源占用、数据库完成统计、脱敏运行日志及当前音频块进度。
+- 可保存的北京时间每日定时开关；电脑开机且控制台服务运行时有效。
+- 搜索本地课程目录、添加或取消订阅，写入 `.env`，下次启动生效。
+- 直接阅读本地讲义并下载 Markdown，无需上传 GitHub。
+- 从学校邮箱只读导入 `[FiCS]` 邮件及 PDF/Markdown 附件，或导入 `.eml`。
+- 完成邮箱配置后，每 3 分钟自动只读导入新讲义邮件，重复邮件自动跳过。
+
+邮箱在控制台的“邮箱导入”页面配置。复旦云邮箱采用 `imap.exmail.qq.com:993`
+及客户端专用密码，使用前需在邮箱网页端开启客户端协议。客户端专用密码仅保存
+在已被 Git 忽略的 `.env` 中，不返回前端。导入使用 `readonly=True` 与 `BODY.PEEK`，
+不会删除邮箱邮件或修改未读标记，只匹配 `SMTP_EMAIL` 发出的 `[FiCS]` 讲义邮件。
+
+停止会结束当前处理与音视频子进程，保留已保存数据库；串行入口没有音频块级恢复，
+重新开始时未保存的当前课次可能重新识别。定时默认关闭，运行中的任务不会重复启动。
+关掉浏览器标签页不会关闭后台网站，电脑关机或退出网站服务后定时也会停止。
+
+控制台仅监听本机地址，包含来源、主机与随机请求令牌校验。
+不要直接将这个本机控制接口暴露到公网。原 `frontend/` GitHub 查看器保持可用。
+
+运行控制台专项测试：`python -m unittest tests.test_control_plane -v`。
+
 Python 依赖在 [requirements.txt](requirements.txt)，本地公式渲染依赖在 [package.json](package.json)。ASR 所需的 CPU 版 PyTorch 和 `qwen-asr` 由 [Actions 运行环境](.github/actions/qwen-pilot-runtime/action.yml) 单独安装；仅执行 `pip install -r requirements.txt` 不构成完整识别环境。
 
 配置测试所需依赖后，可运行隔离测试：
@@ -196,3 +223,23 @@ python -m unittest discover -s tests
 ```
 
 PDF／邮件渲染测试还需要系统字体、Pango 和 Cairo；环境配置参考 Actions。测试使用临时数据库、合成输入及模拟服务，不等于实际课程调用。修改正式处理逻辑后应区分隔离测试、完整课堂验证和真实发布验证，并保留旧输入与检查点。
+
+### 本机 NVIDIA 显卡加速
+
+Windows 本机可运行 `setup_gpu.ps1` 安装独立的 CUDA 12.8 PyTorch 环境，然后在 `.env` 设置 `ASR_DEVICE=cuda:0`。`run_local.py` 仅为课程处理进程加载 `work/cuda-runtime`，不会替换系统的 CPU PyTorch；GitHub Actions 默认仍用 CPU。
+
+GPU 使用同一固定版本的 Qwen3-ASR-1.7B，以 BF16、可配置批量推理运行，保留术语提示、完整性检查、重试与去重逻辑。日志会显示实际设备和显卡名称，网站进度标识显示“GPU 加速”。显卡不可用时会明确报错。回到 CPU 可将 `ASR_DEVICE` 改为 `cpu`，重新启动课程任务。
+
+切换运行设备需要重新启动课程处理进程；数据库中已完成的讲义会复用，尚未保存完整转录的当前课次会重新识别。
+
+
+### 本机工作台更新（2026-10-12）
+
+- 资料库按课程、日期和课次合并本地与邮箱重复条目，优先使用本地已生成讲义。邮箱汇总内容按课次单独阅读，原邮件仍保留在邮箱归档。
+- `data/handouts` 自动保存每节课的独立 Markdown，文件名为日期加课次 ID。可确认的旧重复文件移到 `data/local-control/duplicate-handouts`，可恢复；不同课次即使正文相同也保留。
+- 处理完成后保持开机。旧自动关机计划已取消，自动修复程序不再调用 Windows 关机。
+- CUDA 默认批量为 2，支持 1–4；每批 4 个语音块请在 `.env` 设置 `ASR_BATCH_SIZE=4`。同一次 Qwen 推理处理多个语音块，保留原始顺序、质量检查及逐块检查点；显存不足回退到单块，质量异常回到原有有界重试。
+- 5070 Laptop 本次两段各 30 秒实测：串行 7.45 秒，批量 3.55 秒，峰值 4240 MB。仅代表此测试，不代表整批课程必然获得同等加速。
+
+
+本机工作台的前端在 `dashboard/`，服务器在 `src/control_plane/`。GitHub Pages 的 `frontend/` 提供“本机工作台”入口，需先运行本机服务器；静态 Pages 不提供本机进程控制服务。`dashboard/` 的 Markdown、HTML 清理及数学渲染依赖均包含在 `dashboard/vendor/`，不要求访问 CDN。

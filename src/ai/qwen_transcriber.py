@@ -1,4 +1,4 @@
-"""Qwen-only CPU recognizer: bounded two-minute blocks, silence-aware VAD."""
+"""Qwen recognizer for CPU or CUDA: bounded blocks, silence-aware VAD."""
 from __future__ import annotations
 import gc
 from contextlib import nullcontext
@@ -76,13 +76,24 @@ class QwenTranscriber:
         # Set interop once; subsequent lecture loads share the same process.
         try: torch.set_num_interop_threads(1)
         except RuntimeError: pass
+        device = config.ASR_DEVICE
+        if device not in ('cpu', 'cuda', 'cuda:0'):
+            raise ValueError('ASR_DEVICE must be cpu, cuda or cuda:0')
+        if device != 'cpu' and not torch.cuda.is_available():
+            raise RuntimeError('CUDA requested but unavailable; check the local GPU runtime')
+        dtype = torch.float32 if device == 'cpu' else torch.bfloat16
         path=snapshot_download(MODEL,revision=REVISION,allow_patterns=['*.json','*.safetensors','*.txt'])
-        self._model=Qwen3ASRModel.from_pretrained(path,dtype=torch.float32,device_map='cpu',
-            attn_implementation='eager',max_inference_batch_size=1,max_new_tokens=NORMAL_TOKENS)
+        self._model=Qwen3ASRModel.from_pretrained(path,dtype=dtype,device_map=device,
+            attn_implementation='eager',max_inference_batch_size=config.ASR_BATCH_SIZE,max_new_tokens=NORMAL_TOKENS)
+        print(f'[Qwen] Runtime: {device} / {dtype}', flush=True)
+        if device != 'cpu': print(f'[Qwen] GPU: {torch.cuda.get_device_name(0)}', flush=True)
 
     def release_model(self):
         self._model=None
         gc.collect()
+        if config.ASR_DEVICE != 'cpu':
+            import torch
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     def _recognize(self, samples, *, unhinted=False, deadline=None):
         import torch
@@ -296,6 +307,25 @@ class QwenTranscriber:
         self.last_vad_windows=[(a,min(b,self._last_duration)) for a,b in self.last_vad_windows if a<self._last_duration]
         return plan_long_chunks(self.last_vad_windows,self._last_duration)
 
+    def _recognize_batch(self, samples, deadline):
+        """One model forward batch; ambiguous results fall back to bounded singles."""
+        import torch
+        from transformers import StoppingCriteriaList
+        context=('术语：'+'、'.join(self._terms)) if self._terms else ''
+        budget=min(max(0,deadline-time.monotonic()),600+12*max(len(x)/RATE for x in samples))
+        with bounded_retry(self._model,StoppingCriteriaList,seconds=budget,tokens=NORMAL_TOKENS,clock=time.monotonic) as state, generation_audit(self._model,clock=time.monotonic) as evidence, torch.inference_mode():
+            results=self._model.transcribe(audio=[(x,RATE) for x in samples],context=context,language='Chinese')
+        if len(results)!=len(samples): raise RuntimeError('Qwen batch result count mismatch')
+        capped=any(g['generated_tokens']>=g['token_limit'] for g in evidence)
+        rows=[]
+        for result in results:
+            tokens=len(self._model.processor.tokenizer.encode(result.text,add_special_tokens=False))
+            uncertain=state['timed_out'] or capped or tokens>=NORMAL_TOKENS-8 or (context and context_echo(result.text,context))
+            rows.append(None if uncertain else {'text':'' if low_information(result.text) else result.text,
+                'quality_state':'low_information' if low_information(result.text) else 'recognized',
+                'generation_diagnostics':list(evidence)})
+        return rows
+
     def recognize_blocks(self, blocks, load_samples, *, checkpoint=None, timeout=18000, keep_model=False):
         """Decode immutable original blocks; leave global ordering/dedupe to caller."""
         self.last_chunks=[]
@@ -305,26 +335,37 @@ class QwenTranscriber:
             if timeout <= 0:
                 raise TimeoutError('Qwen shard timeout')
             self._init()
-            for i, block in enumerate(blocks):
-                if time.monotonic()-began>=timeout:
-                    raise TimeoutError('Qwen shard timeout')
-                samples=load_samples(block)
-                expected=round(block['end']*RATE)-round(block['start']*RATE)
-                if len(samples)!=expected:
-                    raise RuntimeError('Incomplete Qwen audio block')
+            batch_size=config.ASR_BATCH_SIZE
+            for offset in range(0,len(blocks),batch_size):
+                group=blocks[offset:offset+batch_size]
+                if time.monotonic()-began>=timeout: raise TimeoutError('Qwen shard timeout')
+                samples=[]
+                for block in group:
+                    audio=load_samples(block)
+                    expected=round(block['end']*RATE)-round(block['start']*RATE)
+                    if len(audio)!=expected: raise RuntimeError('Incomplete Qwen audio block')
+                    samples.append(audio)
                 started=time.monotonic()
-                row=self._recognize_resilient(samples,block,began+timeout)
-                row.update(start=block['start'],end=block['end'],
-                           chunk_id=block['chunk_id'],decode_seconds=time.monotonic()-started)
-                self.last_chunks.append(row)
-                for a,b in self.last_vad_windows:
-                    a,b=max(a,row['start']),min(b,row['end'])
-                    if b>a:
-                        self._last_speech_windows.append({'start_ms':round(a*1000),'end_ms':round(b*1000),
-                            'text':row['text'],'chunk_id':row['chunk_id']})
-                if checkpoint:
-                    checkpoint(self.last_chunks)
-                print(f'[Qwen] Block {i+1}/{len(blocks)} completed.',flush=True)
+                rows=[None]*len(group)
+                if batch_size>1 and len(group)>1 and not getattr(self,'_batch_oom',False):
+                    try:
+                        rows=self._recognize_batch(samples,began+timeout)
+                        print(f'[Qwen] Batch {offset+1}–{offset+len(group)}/{len(blocks)} decoded.',flush=True)
+                    except Exception as error:
+                        import torch
+                        if not isinstance(error,torch.cuda.OutOfMemoryError): raise
+                        self._batch_oom=True
+                        torch.cuda.empty_cache()
+                        print('[Qwen] GPU memory limit; falling back to individual blocks.',flush=True)
+                for index,(block,audio,row) in enumerate(zip(group,samples,rows)):
+                    if row is None: row=self._recognize_resilient(audio,block,began+timeout)
+                    row.update(start=block['start'],end=block['end'],chunk_id=block['chunk_id'],decode_seconds=time.monotonic()-started)
+                    self.last_chunks.append(row)
+                    for a,b in self.last_vad_windows:
+                        a,b=max(a,row['start']),min(b,row['end'])
+                        if b>a: self._last_speech_windows.append({'start_ms':round(a*1000),'end_ms':round(b*1000),'text':row['text'],'chunk_id':row['chunk_id']})
+                    if checkpoint: checkpoint(self.last_chunks)
+                    print(f'[Qwen] Block {offset+index+1}/{len(blocks)} completed.',flush=True)
                 del samples;gc.collect()
         finally:
             if not keep_model:

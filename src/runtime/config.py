@@ -179,6 +179,8 @@ SILERO_VAD_PATH = os.environ.get('SILERO_VAD_PATH', 'silero_vad.onnx')
 ASR_BACKEND = 'qwen'
 # Inference thread count.  4 fully saturates a 4-vCPU GitHub runner.
 ASR_NUM_THREADS = int(os.environ.get("ASR_NUM_THREADS", "4"))
+ASR_DEVICE = os.environ.get('ASR_DEVICE', 'cpu').strip().lower()
+ASR_BATCH_SIZE = max(1, min(4, int(os.environ.get('ASR_BATCH_SIZE', '2' if ASR_DEVICE.startswith('cuda') else '1'))))
 
 # ── Scheduler concurrency knobs.  All overridable via env. ────────────────
 # image_pool: image downloads are tiny and IO-bound, 20 saturates bandwidth
